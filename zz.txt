@@ -1,168 +1,326 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import time
+import math
+from io import StringIO
+
+import av
 import cv2
 import mediapipe as mp
-import av
 import numpy as np
-import time
-import queue  # 데이터 전송용 큐
-
-# ---------------- 1. 기본 설정 ----------------
-st.set_page_config(page_title="AI 얼짱각도 (저장가능)", layout="centered")
-
-# 세션 상태 초기화 (찍은 사진 저장용)
-if "snapshot" not in st.session_state:
-    st.session_state.snapshot = None
-
-st.title("📸 AI 얼짱각도")
-st.info("각도가 맞으면 자동으로 찍히고, 다운로드 버튼이 생깁니다!")
-
-# ---------------- 2. 사이드바 설정 ----------------
-st.sidebar.header("⚙️ 설정")
-# 모바일 화각 고려한 범위 (0.02 ~ 0.15)
-min_val = st.sidebar.slider("최소 각도", 0.0, 0.3, 0.02, 0.01)
-max_val = st.sidebar.slider("최대 각도", 0.0, 0.3, 0.15, 0.01)
-
-# ---------------- 3. Mediapipe 초기화 ----------------
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+import streamlit as st
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    RTCConfiguration,
+    VideoTransformerBase,
 )
 
-# ---------------- 4. 영상 처리 클래스 ----------------
-class VideoProcessor(VideoProcessorBase):
+# ========= Mediapipe 세팅 =========
+mp_face = mp.solutions.face_detection
+
+# WebRTC STUN 서버 설정 (외부 접속용)
+RTC_CONFIGURATION = RTCConfiguration(
+    {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+        ]
+    }
+)
+
+
+# ========= 유틸 함수들 =========
+def calc_roll_angle_from_detection(detection, width, height):
+    """
+    Mediapipe FaceDetection 결과에서 얼굴 기울기(roll angle)를 계산.
+    여기서는 두 눈 위치를 이용해서 각도 구함.
+    """
+    keypoints = detection.location_data.relative_keypoints
+
+    # LEFT_EYE = 0, RIGHT_EYE = 1 (mediapipe docs 기준)
+    left_eye = keypoints[0]
+    right_eye = keypoints[1]
+
+    x1, y1 = left_eye.x * width, left_eye.y * height
+    x2, y2 = right_eye.x * width, right_eye.y * height
+
+    dx = x2 - x1
+    dy = y2 - y1
+
+    angle_rad = math.atan2(dy, dx)
+    angle_deg = math.degrees(angle_rad)
+
+    return angle_deg
+
+
+def analyze_reference_image(file) -> float | None:
+    """
+    업로드된 기준 사진에서 얼굴을 찾고 각도를 계산해서 반환.
+    실패 시 None.
+    """
+    file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    if img is None:
+        st.error("기준 이미지를 불러올 수 없습니다.")
+        return None
+
+    h, w, _ = img.shape
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    with mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.6) as detector:
+        res = detector.process(rgb)
+
+    if not res.detections:
+        st.error("기준 이미지에서 얼굴을 찾지 못했습니다.")
+        return None
+
+    detection = res.detections[0]
+    angle = calc_roll_angle_from_detection(detection, w, h)
+    return angle
+
+
+def encode_image_to_png_bytes(img_bgr: np.ndarray) -> bytes:
+    """BGR 이미지를 PNG 바이트로 인코딩."""
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise RuntimeError("이미지 인코딩 실패")
+    return buf.tobytes()
+
+
+# ========= WebRTC용 VideoTransformer =========
+class FaceAngleTransformer(VideoTransformerBase):
     def __init__(self):
-        self.enter_time = None
-        self.capture_triggered = False
-        self.last_capture_time = 0
-        self.flash_frame = 0
-        # 메인 스레드로 사진을 보내기 위한 우체통(Queue)
-        self.result_queue = queue.Queue()
+        # Mediapipe detector
+        self.detector = mp_face.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=0.6,
+        )
 
-    def recv(self, frame):
-        # 이미지 가져오기
+        # 상태 값들
+        self.ref_angle: float | None = None   # 기준 사진 각도
+        self.last_angle: float | None = None  # 최근 프레임 각도
+        self.last_diff: float | None = None   # 기준과의 차이
+        self.last_frame: np.ndarray | None = None  # 최근 프레임 (BGR)
+
+        # 로그 기록 (시간, 각도, 차이)
+        self.log = []
+
+    def set_reference_angle(self, angle: float | None):
+        self.ref_angle = angle
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1) # 거울 모드
-        h, w, _ = img.shape
-        
-        # 얼굴 분석
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb_img)
-        
-        current_z = 0.0
-        in_range = False
-        border_color = (0, 0, 255) # 빨강
-        status_msg = "Adjust Angle"
-        
-        # 플래시 효과
-        if self.flash_frame > 0:
-            self.flash_frame -= 1
-            white = np.full((h, w, 3), 255, dtype=np.uint8)
-            img = cv2.addWeighted(img, 0.5, white, 0.5, 0)
+        self.last_frame = img.copy()
 
-        if results.multi_face_landmarks:
-            landmarks = results.multi_face_landmarks[0].landmark
-            chin = landmarks[152].z
-            forehead = landmarks[10].z
-            current_z = (chin - forehead) * -1 
-            
-            # 범위 체크 (0.02 ~ 0.15)
-            # (클래스 내부라 슬라이더 값을 직접 받기 어려워 모바일 최적값으로 고정하거나 넓게 잡음)
-            if 0.02 <= current_z <= 0.20: 
-                in_range = True
-                border_color = (0, 255, 0) # 초록
-                status_msg = "HOLD ON!"
-            
-            # 그리기
-            cv2.rectangle(img, (0,0), (w,h), border_color, 20)
-            cv2.putText(img, f"Z: {current_z:.4f}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, border_color, 3)
-            cv2.putText(img, status_msg, (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
-            
-            # 자동 촬영 로직
-            if in_range:
-                if self.enter_time is None:
-                    self.enter_time = time.time()
-                
-                elapsed = time.time() - self.enter_time
-                countdown = 1.5 - elapsed
-                
-                if countdown > 0:
-                    # 카운트다운
-                    cx, cy = w//2, h//2
-                    cv2.putText(img, f"{countdown:.1f}", (cx-50, cy+20), cv2.FONT_HERSHEY_SIMPLEX, 4, (0, 255, 255), 5)
-                else:
-                    # ★ 촬영 시점 ★
-                    if not self.capture_triggered:
-                        if time.time() - self.last_capture_time > 3:
-                            
-                            # [중요] 찍힌 사진을 큐(우체통)에 넣어서 메인 화면으로 보냄
-                            # (OpenCV 이미지는 BGR이므로 RGB 변환해서 보냄)
-                            save_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            self.result_queue.put(save_img)
-                            
-                            self.last_capture_time = time.time()
-                            self.capture_triggered = True
-                            self.flash_frame = 5
-            else:
-                self.enter_time = None
-                self.capture_triggered = False
-                
+        img_h, img_w, _ = img.shape
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        res = self.detector.process(img_rgb)
+
+        angle = None
+        diff = None
+
+        if res.detections:
+            detection = res.detections[0]
+            angle = calc_roll_angle_from_detection(detection, img_w, img_h)
+            self.last_angle = angle
+
+            # 기준 각도와 차이
+            if self.ref_angle is not None:
+                diff = angle - self.ref_angle
+                self.last_diff = diff
+
+            # 화면에 그리기 (박스 + 텍스트)
+            relative_bbox = detection.location_data.relative_bounding_box
+            x1 = int(relative_bbox.xmin * img_w)
+            y1 = int(relative_bbox.ymin * img_h)
+            w = int(relative_bbox.width * img_w)
+            h = int(relative_bbox.height * img_h)
+
+            cv2.rectangle(img, (x1, y1), (x1 + w, y1 + h), (0, 255, 0), 2)
+
+            text = f"angle: {angle:.1f} deg"
+            if diff is not None:
+                text += f" | diff: {diff:+.1f} deg"
+
+            cv2.putText(
+                img,
+                text,
+                (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # 로그 저장 (초당 수십번이라도 상관없으면 그냥 다 저장)
+            self.log.append(
+                {
+                    "time": time.time(),
+                    "angle": float(angle),
+                    "diff": float(diff) if diff is not None else None,
+                }
+            )
+
+        else:
+            self.last_angle = None
+            self.last_diff = None
+
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------------- 5. WebRTC 실행 및 다운로드 UI ----------------
 
-# 만약 찍어둔 사진이 있으면 화면에 보여주고 다운로드 버튼 생성
-if st.session_state.snapshot is not None:
-    st.success("📸 인생샷 건짐!")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(st.session_state.snapshot, caption="방금 찍은 사진", use_container_width=True)
-    with col2:
-        # 이미지를 바이트로 변환
-        img_bgr = cv2.cvtColor(st.session_state.snapshot, cv2.COLOR_RGB2BGR)
-        is_success, buffer = cv2.imencode(".jpg", img_bgr)
-        
-        if is_success:
-            st.download_button(
-                label="📥 내 폰에 저장하기",
-                data=buffer.tobytes(),
-                file_name=f"Selfie_{int(time.time())}.jpg",
-                mime="image/jpeg",
-                type="primary"
-            )
-    
-    if st.button("🔄 다시 찍기"):
-        st.session_state.snapshot = None
-        st.rerun()
+# ========= Streamlit UI =========
+def main():
+    st.set_page_config(page_title="얼굴 각도 분석 데모", layout="wide")
+    st.title("📷 얼굴 각도 분석 · 기준 사진과의 유사도 체크")
 
-# 사진이 없을 때만 카메라 보여주기
-else:
-    ctx = webrtc_streamer(
-        key="mobile-camera-save",
-        video_processor_factory=VideoProcessor,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"video": {"facingMode": "user"}, "audio": False},
+    st.write(
+        """
+        - 왼쪽에서 **기준 사진**을 업로드해서 기준 얼굴 각도를 설정합니다.  
+        - 오른쪽에 카메라를 켜면 실시간으로 각도와 기준 대비 차이를 보여줍니다.  
+        - 아래에서 **스냅샷 저장 / CSV 다운로드**도 할 수 있습니다.
+        """
     )
 
-    # [핵심] 실시간으로 큐 확인 (사진이 왔나 안 왔나 감시)
-    if ctx.state.playing:
-        status_ph = st.empty()
-        while True:
-            if ctx.video_processor:
-                try:
-                    # 큐에서 사진 꺼내기 (0.1초 대기)
-                    result_img = ctx.video_processor.result_queue.get(timeout=0.1)
-                    
-                    # 사진이 도착하면 세션에 저장하고 새로고침!
-                    if result_img is not None:
-                        st.session_state.snapshot = result_img
-                        st.rerun() # 화면 갱신해서 다운로드 버튼 보여줌
-                except queue.Empty:
-                    # 사진 없으면 계속 대기
-                    pass
-            time.sleep(0.1)
+    if "snapshot_counter" not in st.session_state:
+        st.session_state["snapshot_counter"] = 0
+    if "last_snapshot_png" not in st.session_state:
+        st.session_state["last_snapshot_png"] = None
+
+    col_left, col_right = st.columns(2)
+
+    # ---- 기준 사진 업로드 & 분석 ----
+    with col_left:
+        st.subheader("1️⃣ 기준 사진 설정")
+
+        uploaded_file = st.file_uploader(
+            "얼굴이 잘 나온 기준 사진을 업로드하세요 (jpg, png 등)",
+            type=["jpg", "jpeg", "png"],
+        )
+
+        ref_angle = None
+        if uploaded_file is not None:
+            if st.button("기준 사진 각도 분석하기"):
+                ref_angle = analyze_reference_image(uploaded_file)
+                if ref_angle is not None:
+                    st.success(f"기준 얼굴 각도: {ref_angle:.2f}°")
+                    st.session_state["ref_angle_value"] = ref_angle
+
+        # 이미 계산된 기준 각도가 세션에 있다면 표시
+        if "ref_angle_value" in st.session_state:
+            st.info(f"현재 저장된 기준 각도: {st.session_state['ref_angle_value']:.2f}°")
+
+    # ---- 카메라 WebRTC ----
+    with col_right:
+        st.subheader("2️⃣ 카메라로 실시간 분석")
+
+        webrtc_ctx = webrtc_streamer(
+            key="face-angle-demo",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            video_transformer_factory=FaceAngleTransformer,
+            async_processing=True,
+        )
+
+        # 기준 각도를 transformer에 반영
+        if webrtc_ctx.video_transformer:
+            transformer: FaceAngleTransformer = webrtc_ctx.video_transformer
+
+            if "ref_angle_value" in st.session_state:
+                transformer.set_reference_angle(st.session_state["ref_angle_value"])
+
+            # 현재 각도 / 차이 정보 표시
+            angle_placeholder = st.empty()
+            diff_placeholder = st.empty()
+
+            if webrtc_ctx.state.playing:
+                # 이 부분은 스트림릿이 재실행될 때마다 갱신됨
+                current_angle = transformer.last_angle
+                current_diff = transformer.last_diff
+
+                if current_angle is not None:
+                    angle_placeholder.metric("현재 얼굴 각도", f"{current_angle:.2f}°")
+                else:
+                    angle_placeholder.write("얼굴을 찾지 못했습니다.")
+
+                if current_diff is not None and transformer.ref_angle is not None:
+                    diff_placeholder.metric(
+                        "기준 대비 차이",
+                        f"{current_diff:+.2f}°",
+                    )
+                elif transformer.ref_angle is None:
+                    diff_placeholder.write("기준 각도가 아직 설정되지 않았습니다.")
+                else:
+                    diff_placeholder.write("차이를 계산할 수 없습니다.")
+
+    st.markdown("---")
+
+    # ---- 스냅샷 저장 & CSV 다운로드 ----
+    st.subheader("3️⃣ 스냅샷 및 기록 저장")
+
+    if "ref_angle_value" in st.session_state:
+        st.write(f"사용 중인 기준 각도: **{st.session_state['ref_angle_value']:.2f}°**")
+
+    # webrtc 컨텍스트 다시 사용 (위에서 만들었던 것)
+    webrtc_ctx = st.session_state.get("webrtc_state_face-angle-demo", None)
+    # ↑ 최신 streamlit-webrtc에서는 ctx를 세션에 자동 저장 안 할 수도 있음 → 아래에서 다시 가져옴
+    # 하지만 위에서 만든 webrtc_ctx를 그대로 쓰고 싶으면 구조를 합쳐도 무방함.
+
+    # 실제로는 바로 윗부분에서 생성한 webrtc_ctx를 다시 사용하는 게 더 확실하므로,
+    # 간단하게 다시 한 번 가져오는 방식 대신, 위에서 정의한 webrtc_ctx를 그대로 쓰는 설계도 가능.
+
+    # 여기서는 설명 단순화를 위해 위쪽 col_right의 webrtc_ctx를 다시 써야 함:
+    # (Streamlit에서는 같은 run 안이므로 webrtc_ctx 변수는 여전히 유효)
+
+    try:
+        transformer = webrtc_ctx.video_transformer  # type: ignore
+    except Exception:
+        transformer = None
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("현재 화면 스냅샷 저장"):
+            if transformer and transformer.last_frame is not None:
+                img_png = encode_image_to_png_bytes(transformer.last_frame)
+                st.session_state["last_snapshot_png"] = img_png
+                st.session_state["snapshot_counter"] += 1
+                st.success("스냅샷을 임시로 저장했습니다. 아래에서 다운로드할 수 있습니다.")
+            else:
+                st.warning("카메라가 켜져 있고, 얼굴이 보이는 상태인지 확인해주세요.")
+
+        if st.session_state.get("last_snapshot_png") is not None:
+            st.download_button(
+                label=f"마지막 스냅샷 PNG 다운로드 (#{st.session_state['snapshot_counter']})",
+                data=st.session_state["last_snapshot_png"],
+                file_name=f"snapshot_{st.session_state['snapshot_counter']}.png",
+                mime="image/png",
+            )
+
+    with col2:
+        st.write("실시간 각도 기록을 CSV로 다운로드할 수 있습니다.")
+
+        if transformer and transformer.log:
+            # CSV 텍스트 생성
+            csv_buffer = StringIO()
+            csv_buffer.write("time,angle,diff\n")
+            for row in transformer.log:
+                csv_buffer.write(
+                    f"{row['time']},{row['angle']},{'' if row['diff'] is None else row['diff']}\n"
+                )
+
+            csv_data = csv_buffer.getvalue()
+
+            st.download_button(
+                label="측정 기록 CSV 다운로드",
+                data=csv_data,
+                file_name="face_angle_log.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("아직 기록된 각도 로그가 없습니다. 카메라를 켜고 얼굴을 비춰보세요.")
 
 
+if __name__ == "__main__":
+    main()
