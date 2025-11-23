@@ -155,14 +155,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-2. requirements.txt (필수)
-버전 충돌을 막기 위해 아래 내용을 꼭 사용하세요.
-streamlit
-streamlit-webrtc
-mediapipe
-opencv-python-headless
-av
-numpy
-
-
