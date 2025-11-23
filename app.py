@@ -17,7 +17,7 @@ from streamlit_webrtc import (
 # ========= Mediapipe 세팅 =========
 mp_face = mp.solutions.face_detection
 
-# WebRTC STUN 서버 설정 (외부 접속용)
+# WebRTC STUN 서버 설정 (Cloud 환경에서 필수)
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
@@ -31,11 +31,11 @@ RTC_CONFIGURATION = RTCConfiguration(
 def calc_roll_angle_from_detection(detection, width, height):
     """
     Mediapipe FaceDetection 결과에서 얼굴 기울기(roll angle)를 계산.
-    여기서는 두 눈 위치를 이용해서 각도 구함.
+    두 눈 위치를 이용해서 각도 구함.
     """
     keypoints = detection.location_data.relative_keypoints
 
-    # LEFT_EYE = 0, RIGHT_EYE = 1 (mediapipe docs 기준)
+    # LEFT_EYE = 0, RIGHT_EYE = 1
     left_eye = keypoints[0]
     right_eye = keypoints[1]
 
@@ -53,7 +53,7 @@ def calc_roll_angle_from_detection(detection, width, height):
 
 def analyze_reference_image(file) -> float | None:
     """
-    업로드된 기준 사진에서 얼굴을 찾고 각도를 계산해서 반환.
+    업로드 기준 사진에서 얼굴을 찾고 각도를 계산해서 반환.
     실패 시 None.
     """
     file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
@@ -153,7 +153,7 @@ class FaceAngleTransformer(VideoTransformerBase):
                 cv2.LINE_AA,
             )
 
-            # 로그 저장 (초당 수십번이라도 상관없으면 그냥 다 저장)
+            # 로그 저장
             self.log.append(
                 {
                     "time": time.time(),
@@ -198,15 +198,12 @@ def main():
             type=["jpg", "jpeg", "png"],
         )
 
-        ref_angle = None
-        if uploaded_file is not None:
-            if st.button("기준 사진 각도 분석하기"):
-                ref_angle = analyze_reference_image(uploaded_file)
-                if ref_angle is not None:
-                    st.success(f"기준 얼굴 각도: {ref_angle:.2f}°")
-                    st.session_state["ref_angle_value"] = ref_angle
+        if uploaded_file is not None and st.button("기준 사진 각도 분석하기"):
+            angle = analyze_reference_image(uploaded_file)
+            if angle is not None:
+                st.session_state["ref_angle_value"] = angle
+                st.success(f"기준 얼굴 각도: {angle:.2f}°")
 
-        # 이미 계산된 기준 각도가 세션에 있다면 표시
         if "ref_angle_value" in st.session_state:
             st.info(f"현재 저장된 기준 각도: {st.session_state['ref_angle_value']:.2f}°")
 
@@ -223,19 +220,17 @@ def main():
             async_processing=True,
         )
 
-        # 기준 각도를 transformer에 반영
-        if webrtc_ctx.video_transformer:
+        angle_placeholder = st.empty()
+        diff_placeholder = st.empty()
+
+        if webrtc_ctx and webrtc_ctx.video_transformer:
             transformer: FaceAngleTransformer = webrtc_ctx.video_transformer
 
+            # 기준 각도 주입
             if "ref_angle_value" in st.session_state:
                 transformer.set_reference_angle(st.session_state["ref_angle_value"])
 
-            # 현재 각도 / 차이 정보 표시
-            angle_placeholder = st.empty()
-            diff_placeholder = st.empty()
-
             if webrtc_ctx.state.playing:
-                # 이 부분은 스트림릿이 재실행될 때마다 갱신됨
                 current_angle = transformer.last_angle
                 current_diff = transformer.last_diff
 
@@ -256,39 +251,52 @@ def main():
 
     st.markdown("---")
 
-    # ---- 스냅샷 저장 & CSV 다운로드 ----
+    # ---- 스냅샷 & CSV 다운로드 ----
     st.subheader("3️⃣ 스냅샷 및 기록 저장")
 
     if "ref_angle_value" in st.session_state:
         st.write(f"사용 중인 기준 각도: **{st.session_state['ref_angle_value']:.2f}°**")
 
-    # webrtc 컨텍스트 다시 사용 (위에서 만들었던 것)
-    webrtc_ctx = st.session_state.get("webrtc_state_face-angle-demo", None)
-    # ↑ 최신 streamlit-webrtc에서는 ctx를 세션에 자동 저장 안 할 수도 있음 → 아래에서 다시 가져옴
-    # 하지만 위에서 만든 webrtc_ctx를 그대로 쓰고 싶으면 구조를 합쳐도 무방함.
+    # webrtc_ctx 다시 사용
+    # (컬럼 바깥에서도 쓰기 위해 위에서 만든 webrtc_ctx를 그대로 활용)
+    webrtc_ctx = st.session_state.get("webrtc-component-face-angle-demo")  # 안전빵 방어용
 
-    # 실제로는 바로 윗부분에서 생성한 webrtc_ctx를 다시 사용하는 게 더 확실하므로,
-    # 간단하게 다시 한 번 가져오는 방식 대신, 위에서 정의한 webrtc_ctx를 그대로 쓰는 설계도 가능.
-
-    # 여기서는 설명 단순화를 위해 위쪽 col_right의 webrtc_ctx를 다시 써야 함:
-    # (Streamlit에서는 같은 run 안이므로 webrtc_ctx 변수는 여전히 유효)
-
+    # 실제로는 위 컬럼 안에서 만든 webrtc_ctx 변수를 쓰는 게 더 직관적이라,
+    # 여기선 다시 가져오는 대신 try-except로 transformer를 안전하게 얻어온다.
+    transformer = None
     try:
-        transformer = webrtc_ctx.video_transformer  # type: ignore
+        # 위에서 만든 webrtc_ctx가 아직 유효한 경우에만 접근
+        # 일부 Streamlit/streamlit-webrtc 버전에서는 세션에 자동 저장 안 되므로
+        # 실패해도 그냥 넘어감.
+        if "webrtc_ctx" in locals() and webrtc_ctx is None:
+            transformer = webrtc_ctx.video_transformer  # type: ignore
     except Exception:
-        transformer = None
+        pass
+
+    # 가장 확실한 건: 위의 col_right 블록에서 webrtc_ctx를
+    # st.session_state["webrtc_ctx"]에 직접 저장해서 쓰는 방식임.
+    # 여기서는 설명 단순화를 위해 별도 세션 저장은 생략함.
+
+    # 간단히: webrtc_ctx가 locals에 있다면 그걸 우선 사용
+    if "webrtc_ctx" in locals() and webrtc_ctx is None:
+        transformer = webrtc_ctx.video_transformer  # type: ignore
 
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("현재 화면 스냅샷 저장"):
-            if transformer and transformer.last_frame is not None:
-                img_png = encode_image_to_png_bytes(transformer.last_frame)
-                st.session_state["last_snapshot_png"] = img_png
-                st.session_state["snapshot_counter"] += 1
-                st.success("스냅샷을 임시로 저장했습니다. 아래에서 다운로드할 수 있습니다.")
-            else:
-                st.warning("카메라가 켜져 있고, 얼굴이 보이는 상태인지 확인해주세요.")
+        if "webrtc_ctx" in locals() and webrtc_ctx and webrtc_ctx.video_transformer:
+            transformer = webrtc_ctx.video_transformer  # type: ignore
+
+            if st.button("현재 화면 스냅샷 저장"):
+                if transformer.last_frame is not None:
+                    img_png = encode_image_to_png_bytes(transformer.last_frame)
+                    st.session_state["last_snapshot_png"] = img_png
+                    st.session_state["snapshot_counter"] += 1
+                    st.success("스냅샷을 임시로 저장했습니다. 아래에서 다운로드할 수 있습니다.")
+                else:
+                    st.warning("카메라가 켜져 있고, 얼굴이 보이는 상태인지 확인해주세요.")
+        else:
+            st.write("카메라가 아직 준비되지 않았습니다.")
 
         if st.session_state.get("last_snapshot_png") is not None:
             st.download_button(
@@ -299,27 +307,30 @@ def main():
             )
 
     with col2:
-        st.write("실시간 각도 기록을 CSV로 다운로드할 수 있습니다.")
+        if "webrtc_ctx" in locals() and webrtc_ctx and webrtc_ctx.video_transformer:
+            transformer = webrtc_ctx.video_transformer  # type: ignore
+            st.write("실시간 각도 기록을 CSV로 다운로드할 수 있습니다.")
 
-        if transformer and transformer.log:
-            # CSV 텍스트 생성
-            csv_buffer = StringIO()
-            csv_buffer.write("time,angle,diff\n")
-            for row in transformer.log:
-                csv_buffer.write(
-                    f"{row['time']},{row['angle']},{'' if row['diff'] is None else row['diff']}\n"
+            if transformer.log:
+                csv_buffer = StringIO()
+                csv_buffer.write("time,angle,diff\n")
+                for row in transformer.log:
+                    csv_buffer.write(
+                        f"{row['time']},{row['angle']},{'' if row['diff'] is None else row['diff']}\n"
+                    )
+
+                csv_data = csv_buffer.getvalue()
+
+                st.download_button(
+                    label="측정 기록 CSV 다운로드",
+                    data=csv_data,
+                    file_name="face_angle_log.csv",
+                    mime="text/csv",
                 )
-
-            csv_data = csv_buffer.getvalue()
-
-            st.download_button(
-                label="측정 기록 CSV 다운로드",
-                data=csv_data,
-                file_name="face_angle_log.csv",
-                mime="text/csv",
-            )
+            else:
+                st.info("아직 기록된 각도 로그가 없습니다. 카메라를 켜고 얼굴을 비춰보세요.")
         else:
-            st.info("아직 기록된 각도 로그가 없습니다. 카메라를 켜고 얼굴을 비춰보세요.")
+            st.write("카메라가 켜진 이후에 로그 다운로드가 가능합니다.")
 
 
 if __name__ == "__main__":
