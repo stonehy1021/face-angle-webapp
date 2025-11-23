@@ -19,11 +19,11 @@ RTC_CONFIGURATION = RTCConfiguration(
 
 mp_face = mp.solutions.face_detection
 
-# 세션 기본값
+# 세션 기본값 초기화
 for key, default in [
     ("snapshot", None),   # 찍힌 최종 사진
     ("ref_angle", None),  # 기준 사진에서 나온 각도
-    ("angle_tol", 10.0),  # 허용 오차 (도)
+    ("angle_tol", 12.0),  # 허용 오차 (기본 12도 정도로 널널하게)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -36,7 +36,10 @@ if "img_queue" not in st.session_state:
 # 1. 유틸 함수
 # =========================
 def calc_roll_angle_from_detection(detection, width, height):
-    """눈 두 개 위치로 얼굴 기울기(roll) 계산"""
+    """
+    Mediapipe FaceDetection 결과에서 왼/오른쪽 눈 위치를 이용해
+    얼굴 roll(기울기) 각도를 구하는 함수
+    """
     keypoints = detection.location_data.relative_keypoints
     left_eye = keypoints[0]
     right_eye = keypoints[1]
@@ -48,11 +51,14 @@ def calc_roll_angle_from_detection(detection, width, height):
     dy = y2 - y1
 
     angle_rad = math.atan2(dy, dx)
-    return math.degrees(angle_rad)
+    angle_deg = math.degrees(angle_rad)
+    return angle_deg
 
 
 def analyze_reference_image(uploaded_file):
-    """업로드된 기준 사진에서 얼굴 각도 뽑기"""
+    """
+    업로드된 기준(타겟) 사진에서 얼굴 각도(roll)를 분석해서 기준 각도 리턴
+    """
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if img is None:
@@ -64,7 +70,8 @@ def analyze_reference_image(uploaded_file):
     with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as detector:
         res = detector.process(rgb)
         if res.detections:
-            return calc_roll_angle_from_detection(res.detections[0], w, h)
+            angle = calc_roll_angle_from_detection(res.detections[0], w, h)
+            return angle
 
     return None
 
@@ -74,14 +81,15 @@ def analyze_reference_image(uploaded_file):
 # =========================
 class FaceAngleProcessor(VideoProcessorBase):
     """
-    - 얼굴 각도 계산
-    - ref_angle과의 차이가 tolerance 이내면 자동 촬영
-    - 찍힌 이미지는 img_queue로 메인에 전달
+    - 각 프레임에서 얼굴 각도 계산
+    - 최근 여러 프레임의 '평균 각도'를 구해서 안정화
+    - 평균 각도가 ref_angle과 tolerance 이내면 자동 촬영
+    - 찍힌 사진은 img_queue로 메인 스레드에 전달
     """
     def __init__(self):
-        self.ref_angle = None
-        self.tolerance = 10.0
-        self.img_queue = None
+        self.ref_angle = None          # 기준 각도
+        self.tolerance = 12.0          # 허용 오차
+        self.img_queue = None          # 메인 스레드로 보낼 큐
 
         self.detector = mp_face.FaceDetection(
             model_selection=0,
@@ -89,6 +97,24 @@ class FaceAngleProcessor(VideoProcessorBase):
         )
         self.last_capture_time = 0
         self.flash_frame = 0
+
+        # 각도 안정화를 위한 히스토리
+        self.angle_history = []
+        self.max_history = 10  # 최근 10프레임까지만 사용
+
+    def _update_angle_history(self, angle):
+        self.angle_history.append(angle)
+        if len(self.angle_history) > self.max_history:
+            self.angle_history.pop(0)
+
+    def _get_smoothed_angle(self):
+        """
+        최근 angle_history를 이용해 '평균 각도'를 리턴
+        (노이즈 줄이기용)
+        """
+        if not self.angle_history:
+            return None
+        return float(sum(self.angle_history) / len(self.angle_history))
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
@@ -111,16 +137,24 @@ class FaceAngleProcessor(VideoProcessorBase):
         if res.detections:
             detection = res.detections[0]
             current_angle = calc_roll_angle_from_detection(detection, w, h)
-            status_text = f"Cur: {current_angle:.1f}°"
 
-            if self.ref_angle is not None:
-                diff = abs(current_angle - self.ref_angle)
+            # 히스토리에 추가하고, 평균 각도 계산
+            self._update_angle_history(current_angle)
+            smoothed_angle = self._get_smoothed_angle()
+
+            if smoothed_angle is not None:
+                status_text = f"Cur: {current_angle:.1f}° / Avg: {smoothed_angle:.1f}°"
+            else:
+                status_text = f"Cur: {current_angle:.1f}°"
+
+            # 기준 각도가 있을 때만 자동 촬영 로직
+            if (self.ref_angle is not None) and (smoothed_angle is not None):
+                diff = abs(smoothed_angle - self.ref_angle)
                 status_text += f" | Diff: {diff:.1f}° (Tol: {self.tolerance:.0f}°)"
 
-                # 각도 차이가 tolerance 이내면 자동 촬영
+                # '평균 각도'가 기준 각도와 충분히 가까워졌을 때 촬영
                 if diff < self.tolerance:
                     color = (0, 255, 0)
-                    # 최소 3초 간격
                     if time.time() - self.last_capture_time > 3.0:
                         if self.img_queue is not None:
                             save_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -141,7 +175,7 @@ class FaceAngleProcessor(VideoProcessorBase):
                 status_text,
                 (20, 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.6,
                 color,
                 2,
             )
@@ -155,7 +189,7 @@ class FaceAngleProcessor(VideoProcessorBase):
 def main():
     st.title("📸 타겟 구도 맞추는 AI 자동 촬영기")
 
-    # 이미 한 번 찍혔으면 → 사진 + 저장/다시찍기 화면만
+    # 이미 한 번 찍혔으면 → 저장 화면
     if st.session_state.get("snapshot") is not None:
         st.success("타겟 구도에 맞게 촬영 완료!")
 
@@ -185,7 +219,6 @@ def main():
             st.rerun()
         return
 
-    # 아직 사진 없으면: 기준 사진 + 카메라
     col1, col2 = st.columns([1, 1])
 
     # -------- 왼쪽: 기준 사진 업로드 --------
@@ -193,7 +226,7 @@ def main():
         st.subheader("1️⃣ 타겟(기준) 사진 업로드")
 
         uploaded_file = st.file_uploader(
-            "기준 사진 업로드 (얼굴이 잘 나오게)",
+            "기준 사진 업로드 (얼굴이 정면/측면이든 한 번에 보이게)",
             type=["jpg", "jpeg", "png"],
         )
 
@@ -211,11 +244,12 @@ def main():
         else:
             st.warning("기준 사진을 업로드하면 각도를 분석합니다.")
 
+        # 허용 오차 슬라이더 (기본 12도, 노트북이면 15~20도까지도 추천)
         st.session_state.angle_tol = st.slider(
             "허용 각도 오차(도)",
-            min_value=3.0,
+            min_value=5.0,
             max_value=25.0,
-            value=float(st.session_state.get("angle_tol", 10.0)),
+            value=float(st.session_state.get("angle_tol", 12.0)),
             step=1.0,
             help="얼마나 비슷해야 자동 촬영할지 정하는 값입니다.",
         )
@@ -228,9 +262,8 @@ def main():
 
         def processor_factory():
             proc = FaceAngleProcessor()
-            # 여기서 전부 get() 써서 AttributeError 안 나게 함
             proc.ref_angle = st.session_state.get("ref_angle", None)
-            proc.tolerance = float(st.session_state.get("angle_tol", 10.0))
+            proc.tolerance = float(st.session_state.get("angle_tol", 12.0))
             proc.img_queue = queue_ref
             return proc
 
@@ -239,13 +272,30 @@ def main():
             video_processor_factory=processor_factory,
             rtc_configuration=RTC_CONFIGURATION,
             media_stream_constraints={
-                "video": {"facingMode": "user"},
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "facingMode": "user",
+                },
                 "audio": False,
             },
             async_processing=True,
         )
 
-        # 큐에 사진 들어오면 snapshot으로 올리고 화면 전환
+        # 디버그용: 강제 캡쳐 버튼 (파이프라인 확인용)
+        if ctx.state.playing:
+            if st.button("💥 강제 캡쳐 (디버그용)"):
+                # 강제로 한 프레임을 캡쳐하는 건 어렵지만,
+                # 이미 Processor에서 queue로 넣어준 게 있으면 우선 가져옴
+                if not st.session_state.img_queue.empty():
+                    try:
+                        result_img = st.session_state.img_queue.get_nowait()
+                        st.session_state.snapshot = result_img
+                        st.rerun()
+                    except queue.Empty:
+                        pass
+
+        # 자동 촬영된 사진 수신
         if ctx.state.playing:
             if not st.session_state.img_queue.empty():
                 try:
