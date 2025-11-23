@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import cv2
 import mediapipe as mp
 import av
@@ -34,7 +34,6 @@ def calculate_roll_angle(landmarks, img_w, img_h):
     """
     왼쪽 눈(33)과 오른쪽 눈(263)의 좌표를 이용해 얼굴의 기울기(Roll)를 계산
     """
-    # 33: 왼쪽 눈 꼬리, 263: 오른쪽 눈 꼬리 (Face Mesh 기준)
     left_eye = landmarks[33]
     right_eye = landmarks[263]
 
@@ -47,7 +46,6 @@ def calculate_roll_angle(landmarks, img_w, img_h):
     angle_rad = math.atan2(dy, dx)
     angle_deg = math.degrees(angle_rad)
     
-    # 0도가 수평이 되도록 보정 (atan2 결과에 따라 조정 필요할 수 있음, 보통 눈 사이 각도는 수평일 때 0에 가까움)
     return angle_deg
 
 # ---------------- 3. 영상 처리 클래스 ----------------
@@ -201,9 +199,8 @@ if st.session_state.snapshot is not None:
             use_container_width=True
         )
     
-    if st.button("🔄 다시 찍기"):
-        st.session_state.snapshot = None
-        st.rerun()
+    # [수정됨] 다시 찍기 버튼 삭제 후 안내 문구 추가
+    st.warning("🔄 다시 촬영하시려면 웹페이지를 새로고침 해주세요.")
 
 # 4-3. 촬영 화면 (WebRTC)
 elif st.session_state.target_angle is not None:
