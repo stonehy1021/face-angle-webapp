@@ -1,213 +1,177 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import cv2
 import mediapipe as mp
-import av
-import numpy as np
+import math
 import time
-import queue
-import functools
+from pathlib import Path
+import winsound
+import tkinter as tk
+from tkinter import filedialog
 
-# ---------------- 1. 기본 설정 ----------------
-st.set_page_config(page_title="AI 자동 촬영기", layout="centered")
+# ---------------- 초기 설정 ----------------
+# Mediapipe 얼굴 검출 모델 로드
+mp_face = mp.solutions.face_detection
+mp_draw = mp.solutions.drawing_utils
+face_detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.6)
 
-# STUN 서버 (외부 접속용)
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+# 저장 경로 설정 (바탕화면)
+desktop_path = Path.home() / "Desktop"
+desktop_path.mkdir(exist_ok=True)
 
-# 세션 상태 초기화 (사진 저장소 & 우체통)
-if "snapshot" not in st.session_state:
-    st.session_state.snapshot = None
+# ---------------- 함수 정의 ----------------
+def get_face_roll_angle(detection, w, h, mode="abs"):
+    """얼굴의 기울기(Roll)를 계산하여 반환"""
+    kps = detection.location_data.relative_keypoints
+    right_eye = kps[0]
+    left_eye  = kps[1]
+
+    x1, y1 = right_eye.x * w, right_eye.y * h
+    x2, y2 = left_eye.x * w, left_eye.y * h
+
+    dx = x2 - x1
+    dy = y1 - y2
+
+    angle_rad = math.atan2(dy, dx)
+    angle_deg = math.degrees(angle_rad)
+
+    # [-90, 90] 범위로 정규화
+    if angle_deg > 90:
+        angle_deg -= 180
+    elif angle_deg < -90:
+        angle_deg += 180
+
+    return abs(angle_deg) if mode == "abs" else angle_deg
+
+def select_reference_image():
+    """파일 탐색기를 열어 기준 사진 선택 및 분석"""
+    root = tk.Tk()
+    root.withdraw()  # 빈 창 숨기기
     
-# [중요] 우체통(Queue)을 세션에 박제해서 절대 잃어버리지 않게 함
-if "img_queue" not in st.session_state:
-    st.session_state.img_queue = queue.Queue()
-
-st.title("📸 AI 자동 촬영기 (최종)")
-st.info("CAPTURED 메시지가 뜨면 화면이 깜빡이고 다운로드 버튼이 생깁니다.")
-
-# ---------------- 2. 사이드바 설정 ----------------
-st.sidebar.header("⚙️ 설정")
-min_val = st.sidebar.slider("최소 각도", 0.0, 0.3, 0.02, 0.01)
-max_val = st.sidebar.slider("최대 각도", 0.0, 0.3, 0.15, 0.01)
-
-# ---------------- 3. 영상 처리 클래스 ----------------
-class FaceAngleProcessor(VideoProcessorBase):
-    def __init__(self, img_queue):
-        self.img_queue = img_queue # 메인에서 건네받은 우체통
-        self.face_detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0, min_detection_confidence=0.5
-        )
-        
-        # 로직 변수
-        self.match_start_time = None
-        self.last_capture_time = 0
-        self.flash_frame = 0
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
-        h, w, _ = img.shape
-        
-        # 얼굴 분석
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = self.face_detector.process(img_rgb)
-        
-        status_text = "Looking..."
-        color = (0, 0, 255) # 빨강
-
-        if results.detections:
-            detection = results.detections[0]
-            
-            # 각도 계산 (단순화된 Z-diff 로직)
-            kp = detection.location_data.relative_keypoints
-            # 0:LeftEye, 1:RightEye, 2:NoseTip, 3:MouthCenter, 4:Ear, 5:Ear
-            # 모바일용: 코(2)와 눈(0)의 Y좌표 차이를 이용한 깊이 추정
-            # (질문자님이 원하시던 롤링 각도가 아닌, 고개 끄덕임 각도를 추정)
-            # 기존 로직 유지: chin(152) - forehead(10) -> Mediapipe Mesh 필요
-            # 하지만 FaceDetection 모델은 랜드마크가 6개뿐임.
-            # FaceMesh 대신 가벼운 FaceDetection을 쓰되, 각도 로직은 '눈 기울기'로 대체하거나
-            # 단순 FaceMesh로 다시 변경해야 정확함.
-            # 여기서는 질문자님의 의도(FaceMesh 로직)를 살리기 위해 FaceMesh 사용 권장.
-            # ** 중요: 위 코드에서 mp.solutions.face_detection을 썼는데,
-            # 각도(Z-diff)를 보려면 face_mesh를 써야 합니다. 아래에서 FaceMesh로 교체합니다. **
-            
-            pass # 아래 FaceMesh 로직에서 처리
-
-        # [수정] FaceMesh로 정확하게 계산하기 위해 여기서는 반환만 함
-        # 실제 로직은 아래 processor_factory에서 주입된 FaceMesh 사용
-        
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-# [수정] FaceMesh를 사용하는 진짜 프로세서
-class FaceMeshProcessor(VideoProcessorBase):
-    def __init__(self, img_queue):
-        self.img_queue = img_queue
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        self.match_start_time = None
-        self.last_capture_time = 0
-        self.flash_frame = 0
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
-        h, w, _ = img.shape
-        
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(img_rgb)
-        
-        status_text = "Adjust Angle"
-        color = (0, 0, 255) # 빨강
-
-        # 플래시 효과
-        if self.flash_frame > 0:
-            self.flash_frame -= 1
-            white = np.full((h, w, 3), 255, dtype=np.uint8)
-            img = cv2.addWeighted(img, 0.5, white, 0.5, 0)
-            status_text = "CAPTURED!"
-
-        if results.multi_face_landmarks:
-            landmarks = results.multi_face_landmarks[0].landmark
-            
-            # Z-Diff 계산
-            chin = landmarks[152].z
-            forehead = landmarks[10].z
-            current_z = (chin - forehead) * -1 
-            
-            # 범위 체크 (모바일 기준 0.02 ~ 0.15 추천)
-            # 여기선 슬라이더 값을 직접 못 받으니 안전하게 넓은 범위 설정
-            # (실제로는 전역변수나 큐로 값을 넘겨야 하지만 복잡도 줄임)
-            if 0.02 <= current_z <= 0.20:
-                color = (0, 255, 0) # 초록
-                status_text = "HOLD ON!"
-                
-                if self.match_start_time is None:
-                    self.match_start_time = time.time()
-                
-                # 1초 유지 시 촬영
-                if time.time() - self.match_start_time > 1.0:
-                    if time.time() - self.last_capture_time > 3.0:
-                        # ★ 촬영 및 전송 ★
-                        send_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        self.img_queue.put(send_img) # 우체통에 넣음
-                        
-                        self.last_capture_time = time.time()
-                        self.flash_frame = 5
-                        print("📸 서버: 사진 찍어서 큐에 넣음!")
-            else:
-                self.match_start_time = None
-                
-            # 시각화
-            cv2.rectangle(img, (0,0), (w,h), color, 15)
-            cv2.putText(img, f"Z: {current_z:.4f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-            cv2.putText(img, status_text, (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
-            
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
-# ---------------- 4. 메인 로직 ----------------
-
-# 사진이 이미 찍혀 있으면 결과 화면 보여주기
-if st.session_state.snapshot is not None:
-    st.success("🎉 촬영 성공! 저장하세요.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(st.session_state.snapshot, caption="인생샷", use_container_width=True)
-    with col2:
-        # 저장 버튼
-        img_bgr = cv2.cvtColor(st.session_state.snapshot, cv2.COLOR_RGB2BGR)
-        ret, buffer = cv2.imencode('.jpg', img_bgr)
-        if ret:
-            st.download_button(
-                label="📥 갤러리에 저장",
-                data=buffer.tobytes(),
-                file_name=f"Selfie_{int(time.time())}.jpg",
-                mime="image/jpeg",
-                type="primary"
-            )
-    
-    if st.button("🔄 다시 찍기", type="secondary"):
-        st.session_state.snapshot = None
-        st.rerun()
-
-# 사진이 없으면 카메라 보여주기
-else:
-    # [핵심] 우체통을 품은 프로세서 생성기
-    # 이렇게 해야 세션에 있는 우체통을 프로세서가 쓸 수 있음
-    def processor_factory():
-        return FaceMeshProcessor(st.session_state.img_queue)
-
-    ctx = webrtc_streamer(
-        key="mobile-capture",
-        video_processor_factory=processor_factory,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": {"facingMode": "user"}, "audio": False},
-        async_processing=True
+    file_path = filedialog.askopenfilename(
+        title="기준 사진 선택",
+        filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")]
     )
+    
+    if not file_path:
+        print("기준 사진을 선택하지 않았습니다.")
+        return None
 
-    # [핵심] 실시간 우체통 감시 루프
-    if ctx.state.playing:
-        placeholder = st.empty()
-        placeholder.write("📸 카메라 작동 중... (각도를 맞춰보세요)")
+    img = cv2.imread(file_path)
+    if img is None:
+        print(f"이미지를 불러올 수 없습니다: {file_path}")
+        return None
+
+    h, w, _ = img.shape
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    res = face_detector.process(rgb)
+
+    if not res.detections:
+        print("기준 사진에서 얼굴을 찾지 못했습니다.")
+        return None
+
+    angle = get_face_roll_angle(res.detections[0], w, h, mode="abs")
+    print(f"기준 사진 선택 완료: {file_path}")
+    print(f"기준 각도: {angle:.2f}도")
+    return angle
+
+# ---------------- 메인 실행 로직 ----------------
+def run_auto_capture_camera(camera_source=0):
+    """
+    camera_source: 0이면 기본 웹캠, 1이면 외부 카메라, 또는 URL 문자열(IP Webcam)
+    """
+    ref_angle = select_reference_image()
+    if ref_angle is None:
+        return
+
+    # 카메라 시작
+    cap = cv2.VideoCapture(camera_source, cv2.CAP_DSHOW) 
+    # 주의: IP Webcam(URL) 사용 시 cv2.CAP_DSHOW 제거 필요할 수 있음 -> cv2.VideoCapture(camera_source)
+    
+    if not cap.isOpened():
+        print("카메라를 열 수 없습니다. 연결을 확인하세요.")
+        return
+
+    print("카메라 열기 성공! (종료하려면 'q'를 누르세요)")
+
+    captured = False
+    ANGLE_TOLERANCE = 8.0      # 각도 허용 오차 (이 범위 내에 들어오면 촬영)
+    MAX_DIFF_FOR_SIM = 45.0    # 유사도 계산을 위한 최대 각도 차이
+
+    while True:
+        ret, img = cap.read()
+        if not ret:
+            print("프레임 읽기 실패")
+            break
+
+        img_h, img_w, _ = img.shape
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        face_res = face_detector.process(rgb)
         
-        while True:
-            # 0.1초마다 우체통 확인
-            if ctx.video_processor:
-                try:
-                    # 큐에서 사진 꺼내기 (즉시 확인)
-                    if not st.session_state.img_queue.empty():
-                        result_img = st.session_state.img_queue.get()
-                        st.session_state.snapshot = result_img
-                        st.rerun() # 사진 오면 즉시 새로고침!
-                except Exception as e:
-                    print(e)
-            time.sleep(0.1)
+        face_detected = False
+        face_angle = None
+        similarity = 0
+        angle_ok = False
 
+        if face_res.detections:
+            face_detected = True
+            detection = face_res.detections[0]
+            mp_draw.draw_detection(img, detection)
 
+            # 현재 얼굴 각도 계산
+            face_angle = get_face_roll_angle(detection, img_w, img_h, mode="abs")
+            
+            # 기준 각도와 비교
+            diff = abs(face_angle - ref_angle)
+            sim = 1.0 - min(diff / MAX_DIFF_FOR_SIM, 1.0)
+            similarity = int(sim * 100)
+
+            # 허용 오차 내에 들어오면 촬영 조건 충족
+            if diff <= ANGLE_TOLERANCE:
+                angle_ok = True
+
+        # ------ 화면 표시 (UI) ------
+        status_color = (0, 255, 0) if angle_ok else (0, 0, 255)
+        
+        cv2.putText(img, f"Ref Angle: {ref_angle:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        if face_detected:
+            cv2.putText(img, f"Cur Angle: {face_angle:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            cv2.putText(img, f"Similarity: {similarity}%", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # 유사도 게이지 바 그리기
+            bar_x, bar_y, bar_w, bar_h = 10, 110, 200, 20
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 2)
+            fill_w = int(bar_w * similarity / 100)
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), status_color, -1)
+
+        # ------ 자동 촬영 로직 ------
+        if face_detected and angle_ok and not captured:
+            # 캡처 시각을 파일명으로 사용
+            filename = desktop_path / f"capture_{int(time.time())}.jpg"
+            cv2.imwrite(str(filename), img)
+            print(f"✔ 촬영 완료! 저장됨: {filename}")
+            
+            # 찰칵 소리 (Windows 전용)
+            winsound.Beep(1000, 200) 
+            
+            # 연속 촬영 방지를 위한 플래그 설정 (한 번 찍으면 각도가 벗어났다가 다시 들어와야 찍힘)
+            captured = True
+            
+            # 시각적 피드백 (화면 깜빡임 효과)
+            cv2.rectangle(img, (0, 0), (img_w, img_h), (255, 255, 255), 10)
+
+        # 각도가 벗어나면 다시 촬영 가능 상태로 변경
+        if not angle_ok:
+            captured = False
+
+        cv2.imshow("Auto Capture Camera", img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# 실행
+if __name__ == "__main__":
+    # 기본 웹캠 사용 시: 0
+    # 외부 카메라 사용 시: 1 또는 URL 등 (아래 설명 참조)
+    run_auto_capture_camera(0)
